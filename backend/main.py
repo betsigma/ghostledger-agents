@@ -95,6 +95,16 @@ def create_app(service: Agent3Service | None = None, dataset_directory: Path | N
     accounts = install_auth(app, workflow_repository.path)
     ensure_bootstrap_admin(accounts, workflow_repository.path)
 
+    # Local demos: create the four seeded logins so a fresh clone can sign in.
+    # Opt-in, idempotent, and refused when GHOSTLEDGER_ENV=production.
+    if os.getenv("GHOSTLEDGER_DEMO_ACCOUNTS", "0") == "1":
+        from tools.seed_demo_accounts import LOCAL_DEFAULT_PASSWORD, SeedRefused, seed
+
+        try:
+            seed(workflow_repository.path, os.getenv("DEMO_ACCOUNT_PASSWORD") or LOCAL_DEFAULT_PASSWORD)
+        except SeedRefused as exc:
+            print(f"Demo accounts not created: {exc}")
+
     from workflow.admin_api import install_admin_routes
 
     install_admin_routes(app)

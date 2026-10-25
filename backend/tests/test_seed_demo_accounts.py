@@ -64,3 +64,36 @@ def test_cli_uses_env_password_or_prints_the_local_default(workspace_tmp_path, m
     AccountStore(workspace_tmp_path / "env.db").sign_in(
         email="demo.admin@ghostledger.test", password="from-the-environment"
     )
+
+
+def test_backend_creates_demo_logins_on_startup_when_enabled(workspace_tmp_path, monkeypatch):
+    """A fresh clone with GHOSTLEDGER_DEMO_ACCOUNTS=1 can sign in straight away."""
+
+    from http_helpers import make_app
+
+    monkeypatch.delenv("GHOSTLEDGER_ENV", raising=False)
+    monkeypatch.delenv("DEMO_ACCOUNT_PASSWORD", raising=False)
+    monkeypatch.setenv("GHOSTLEDGER_DEMO_ACCOUNTS", "1")
+    app, client = make_app(workspace_tmp_path, "startup-on")
+
+    for email, role in (("demo.admin@ghostledger.test", ROLE_DEMO_ADMIN), ("bank.admin@ghostledger.test", ROLE_BANK_ADMIN),
+                        ("customer.a@ghostledger.test", ROLE_CUSTOMER), ("customer.b@ghostledger.test", ROLE_CUSTOMER)):
+        response = client.post("/auth/signin", json={"email": email, "password": LOCAL_DEFAULT_PASSWORD})
+        assert response.status_code == 200, email
+        assert response.json()["account"]["role"] == role
+
+    # Restarting changes nothing and never resets a password.
+    make_app(workspace_tmp_path, "startup-on")
+    assert app.state.accounts.count() == 4
+
+
+def test_backend_creates_no_demo_logins_by_default_or_in_production(workspace_tmp_path, monkeypatch):
+    from http_helpers import make_app
+
+    app, _client = make_app(workspace_tmp_path, "startup-off")
+    assert app.state.accounts.count() == 0
+
+    monkeypatch.setenv("GHOSTLEDGER_DEMO_ACCOUNTS", "1")
+    monkeypatch.setenv("GHOSTLEDGER_ENV", "production")
+    app, _client = make_app(workspace_tmp_path, "startup-prod")
+    assert app.state.accounts.count() == 0

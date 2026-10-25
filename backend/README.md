@@ -316,6 +316,10 @@ python -m tools.seed_demo_accounts                  # or: --db path\to\agent3.db
 | `customer.a@ghostledger.test` | `CUSTOMER` |
 | `customer.b@ghostledger.test` | `CUSTOMER` |
 
+Or let the backend do it: with `GHOSTLEDGER_DEMO_ACCOUNTS=1` in `.env` (already
+in `.env.example`), the same four accounts are created when the API starts, so a
+fresh clone can sign in without running the tool.
+
 Without `DEMO_ACCOUNT_PASSWORD` the local default `ghostledger-demo` is used and
 printed. Running it again changes nothing and never resets a password. It
 refuses to run when `GHOSTLEDGER_ENV=production`. The database is

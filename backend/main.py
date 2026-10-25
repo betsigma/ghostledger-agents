@@ -271,13 +271,19 @@ def create_app(service: Agent3Service | None = None, dataset_directory: Path | N
         }
 
     @app.get("/customers", response_model=list[CustomerProfile])
-    def list_customers() -> list[CustomerProfile]:
-        """List the existing fictional reference records used for matching."""
+    def list_customers(request: Request) -> list[CustomerProfile]:
+        """List the fictional reference records used for matching. Admins only."""
 
+        from workflow.auth_api import require_admin
+
+        require_admin(request)
         return app.state.service.repository.list_customers()
 
     @app.get("/customers/{customer_id}", response_model=CustomerProfile)
-    def get_customer(customer_id: str) -> CustomerProfile:
+    def get_customer(customer_id: str, request: Request) -> CustomerProfile:
+        from workflow.auth_api import require_admin
+
+        require_admin(request)
         customer = app.state.service.repository.get_customer(customer_id)
         if not customer:
             raise HTTPException(status_code=404, detail="Customer profile was not found.")
@@ -497,11 +503,23 @@ def create_app(service: Agent3Service | None = None, dataset_directory: Path | N
         from workflow.auth_api import require_customer
 
         account = require_customer(request)
-        # A customer may only look at their own comparables.
-        if not account.is_admin:
-            customer = account.display_name
         repository = InvoiceHistoryRepository(app.state.workflow_repository.path)
-        records = repository.list_records(customer=customer, limit=limit)
+        if account.is_admin:
+            records = repository.list_records(customer=customer, limit=limit)
+        else:
+            # A customer sees only records for invoices on cases they own. The
+            # display name is self-chosen at signup, so it cannot be the key.
+            from workflow.agent1_history import normalize_invoice_number
+
+            owned = {
+                normalize_invoice_number(c.invoice_number)
+                for c in app.state.workflow_repository.list_cases(limit=1000)
+                if c.owner_account_id == account.account_id and c.invoice_number
+            }
+            records = [
+                r for r in repository.list_records(limit=10_000)
+                if normalize_invoice_number(r.invoice_number) in owned
+            ][:limit]
         return [
             {
                 "record_id": record.record_id,
@@ -517,9 +535,22 @@ def create_app(service: Agent3Service | None = None, dataset_directory: Path | N
         ]
 
     @app.post("/workflow/cases/{case_id}/execute", response_model=WorkflowCase)
-    def execute_case(case_id: str, request: dict[str, Any] | None = None) -> WorkflowCase:
-        """Execute (or re-inspect) the approved synthetic payment for a case."""
+    def execute_case(
+        case_id: str, http_request: Request, request: dict[str, Any] | None = None
+    ) -> WorkflowCase:
+        """Execute (or re-inspect) the approved synthetic payment for a case.
 
+        Only the case owner or an administrator. Idempotency and the no-retry
+        rules still apply inside the orchestrator.
+        """
+
+        from workflow.auth_api import assert_owner, require_customer
+
+        account = require_customer(http_request)
+        existing = app.state.orchestrator.get(case_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="Case not found.")
+        assert_owner(account, getattr(existing, "owner_account_id", None))
         payload = request or {}
         try:
             return app.state.orchestrator.execute_payment(
@@ -547,10 +578,30 @@ def create_app(service: Agent3Service | None = None, dataset_directory: Path | N
         return receipt.model_dump(mode="json")
 
     @app.get("/workflow/invoices/{invoice_number}/payments")
-    def invoice_payments(invoice_number: str) -> dict[str, Any]:
-        """Every payment attempt for an invoice, including failed and pending ones."""
+    def invoice_payments(invoice_number: str, request: Request) -> dict[str, Any]:
+        """Every payment attempt for an invoice, including failed and pending ones.
 
+        Administrators see every attempt. A customer sees only attempts made for
+        cases they own, so an invoice number alone reveals nothing.
+        """
+
+        from workflow.auth_api import require_customer
+
+        account = require_customer(request)
         attempts = app.state.orchestrator.execution.store.list_for_invoice(invoice_number)
+        if not account.is_admin:
+            orchestrator = app.state.orchestrator
+            owned: dict[str, bool] = {}
+
+            def is_owned(case_id: str | None) -> bool:
+                if not case_id:
+                    return False
+                if case_id not in owned:
+                    case = orchestrator.get(case_id)
+                    owned[case_id] = bool(case and case.owner_account_id == account.account_id)
+                return owned[case_id]
+
+            attempts = [a for a in attempts if is_owned(a.case_id)]
         return {
             "invoice_number": invoice_number,
             "count": len(attempts),
@@ -816,14 +867,25 @@ def create_app(service: Agent3Service | None = None, dataset_directory: Path | N
         ]
 
     @app.get("/agent3/results/{document_id}", response_model=AnalysisResult)
-    def get_result(document_id: str) -> AnalysisResult:
+    def get_result(document_id: str, request: Request) -> AnalysisResult:
+        """A saved analysis. Admins only: the key is a guessable invoice number and
+        saved analyses carry no owner; customers read theirs through their cases."""
+
+        from workflow.auth_api import require_admin
+
+        require_admin(request)
         outcome = app.state.service.repository.get(document_id)
         if not outcome:
             raise HTTPException(status_code=404, detail="No processed document was found.")
         return outcome
 
     @app.get("/agent3/synthetic/customers")
-    def synthetic_customers() -> list[dict[str, Any]]:
+    def synthetic_customers(request: Request) -> list[dict[str, Any]]:
+        """Development corpus. Admins only."""
+
+        from workflow.auth_api import require_admin
+
+        require_admin(request)
         groups: dict[str, dict[str, Any]] = {}
         for record in catalog()["records"]:
             group = groups.setdefault(
@@ -834,7 +896,10 @@ def create_app(service: Agent3Service | None = None, dataset_directory: Path | N
         return sorted(groups.values(), key=lambda item: item["customer_id"])
 
     @app.get("/agent3/synthetic/documents")
-    def synthetic_documents(customer_id: str | None = None) -> list[dict[str, Any]]:
+    def synthetic_documents(request: Request, customer_id: str | None = None) -> list[dict[str, Any]]:
+        from workflow.auth_api import require_admin
+
+        require_admin(request)
         return [
             {
                 "synthetic_id": record["synthetic_id"],
@@ -848,7 +913,10 @@ def create_app(service: Agent3Service | None = None, dataset_directory: Path | N
         ]
 
     @app.post("/agent3/synthetic/analyze/{synthetic_id}", response_model=AnalysisResult)
-    def analyze_synthetic(synthetic_id: str) -> AnalysisResult:
+    def analyze_synthetic(synthetic_id: str, request: Request) -> AnalysisResult:
+        from workflow.auth_api import require_admin
+
+        require_admin(request)
         record = next((item for item in catalog()["records"] if item["synthetic_id"] == synthetic_id), None)
         if not record:
             raise HTTPException(status_code=404, detail="Synthetic document was not found.")
@@ -861,6 +929,9 @@ def create_app(service: Agent3Service | None = None, dataset_directory: Path | N
 
     @app.post("/agent3/synthetic/evaluate")
     def evaluate_synthetic_documents(request: Request) -> dict[str, Any]:
+        from workflow.auth_api import require_admin
+
+        require_admin(request)
         report = evaluate_dataset(request.app.state.dataset_directory)
         report_path = request.app.state.dataset_directory / "evaluation_report.json"
         report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")

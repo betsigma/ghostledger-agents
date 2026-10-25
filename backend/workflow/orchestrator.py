@@ -760,6 +760,15 @@ class WorkflowOrchestrator:
                 f"Agent 1 found {found} for invoice {case.invoice_number or '(unknown)'}, so it cannot be "
                 f"approved for payment. {report.summary}"
             )
+        # First submission: Agent 1's previous-payment check did not run, but its
+        # bank evidence (already scoped to this invoice) may show the money arrived.
+        settled = (investigation.get("payment_analysis") or {}).get("verified_settlements") or 0
+        if payment_state is None and settled:
+            return (
+                f"The bank already shows {settled} settled payment(s) matching invoice "
+                f"{case.invoice_number or '(unknown)'} (same invoice, payment reference, or amount from a "
+                "party to the invoice), so a person must check it before any new payment."
+            )
         return self._duplicate_block(case)
 
     def _existing_payment_block(self, case: WorkflowCase) -> str | None:

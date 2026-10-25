@@ -450,8 +450,12 @@ class FinalConfirmationAgent:
             )
 
         if "blocked_before_approval" in actions and a1 is not None:
-            previous = (a1.data.get("investigation") or {}).get("previous_payment_status")
+            investigation = a1.data.get("investigation") or {}
+            previous = investigation.get("previous_payment_status")
+            if previous is None and (investigation.get("payment_analysis") or {}).get("verified_settlements"):
+                previous = "SETTLEMENT_ON_RECORD"
             why = {
+                "SETTLEMENT_ON_RECORD": "the bank already shows a settled payment that matches it",
                 "ALREADY_PAID": "our records show it has already been paid",
                 "DUPLICATE_PAYMENT_DETECTED": "it appears to have been paid more than once already",
                 "PAYMENT_PENDING": "an earlier payment for it is still being processed",

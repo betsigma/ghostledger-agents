@@ -84,6 +84,7 @@ states the amount, currency and vendor. Otherwise it goes to human review with a
 
 - Only a `BANK_ADMIN` or `DEMO_ADMIN` can approve or reject, never the account that requested the payment. The approver is the signed-in account, recorded in `approval.approved_by_account_id` and in the audit entry's `actor_account_id`; any `approved_by` in the request body is ignored.
 - Nothing executes without an approval record bound to invoice number, payee, amount and currency; any mismatch blocks execution.
+- Agent 1 only counts bank evidence that belongs to the invoice: a row naming the invoice, a payment reference known for it, or (for a row with no invoice label) the same amount with the invoice's vendor or customer as counterparty. A first-time payment request is held for review when such a settled payment already exists.
 - Agent 1 reports before approval. `approve()` re-checks as defence in depth: a case without an Agent 1 report gets the full check, and every case is refused if a settled or pending attempt for the invoice appeared since.
 - Payment attempts are keyed by `sha256(invoice|payee|amount|currency)`, `UNIQUE` in SQLite, so one obligation cannot be paid twice, even from different cases.
 - A `PENDING` attempt blocks further execution. `FAILED` and `PENDING` are never recorded as completed. Nothing is retried automatically.

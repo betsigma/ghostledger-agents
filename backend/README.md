@@ -200,6 +200,10 @@ On success the approval records the signed-in account:
 "source_channel": "message"
 ```
 
+The case also carries `why`, `problems` and `next_action`: the same triage
+values as the case list, so a client can explain a case before Agent 5 answers.
+Receipts in `GET /auth/me` now include their `case_id`.
+
 `customer_response` is set whenever a case ends (`COMPLETED`, `FAILED`,
 `REQUIRES_REVIEW`, and `PENDING`). Outcomes: `PAID`, `PAYMENT_FOUND`,
 `RESOLVED`, `PAYMENT_PENDING`, `REJECTED`, `PAYMENT_FAILED`,

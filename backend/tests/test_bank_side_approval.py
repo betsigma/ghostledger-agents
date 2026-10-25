@@ -131,3 +131,32 @@ def test_case_exposes_approval_policy(workspace_tmp_path):
     users = {entry["user"] for entry in policy["blocked"]}
     assert "Customer P" in users and "CUSTOMER" in users
     assert all(entry["reason"] for entry in policy["blocked"])
+
+
+def test_case_view_carries_the_same_triage_fields_as_the_list(workspace_tmp_path):
+    app, client = make_app(workspace_tmp_path, "triage")
+    customer, _ = signup(client, "c@example.test")
+    case = request_payment(app, client, customer, "INV-BS-T", "281.40")
+
+    view = client.get(f"/workflow/cases/{case['case_id']}", headers=auth(customer)).json()
+    listed = next(c for c in client.get("/workflow/cases", headers=auth(customer)).json() if c["case_id"] == case["case_id"])
+
+    assert view["next_action"] == listed["next_action"]
+    assert view["next_action"].startswith("Approve 281.40 USD")
+    assert view["why"] == listed["why"] and view["why"]
+    assert view["problems"] == listed["problems"]
+
+
+def test_my_receipts_link_to_their_case(workspace_tmp_path):
+    app, client = make_app(workspace_tmp_path, "receipt-link")
+    customer, _ = signup(client, "c@example.test")
+    admin, _ = make_admin(app, client, "bank@example.test")
+    case = request_payment(app, client, customer, "INV-BS-R", "292.50")
+    client.post(f"/workflow/cases/{case['case_id']}/approve", json={}, headers=auth(admin))
+
+    receipts = client.get("/auth/me", headers=auth(customer)).json()["receipts"]
+
+    assert len(receipts) == 1
+    assert receipts[0]["case_id"] == case["case_id"]
+    other, _ = signup(client, "other@example.test")
+    assert client.get("/auth/me", headers=auth(other)).json()["receipts"] == []

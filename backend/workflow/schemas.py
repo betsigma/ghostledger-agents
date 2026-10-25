@@ -428,7 +428,12 @@ class CaseSummary(WorkflowModel):
 class WorkflowCaseView(WorkflowCase):
     """A case as returned by GET /workflow/cases/{id}, with who may approve it.
 
-    ``approval_policy`` is optional so older clients that ignore it keep working.
+    ``approval_policy`` and the triage fields are optional so older clients that
+    ignore them keep working. ``why``, ``problems`` and ``next_action`` are the
+    same values the case list carries (``summarise_for_human``).
     """
 
     approval_policy: dict[str, Any] | None = None
+    why: str | None = None
+    problems: list[str] = Field(default_factory=list)
+    next_action: str | None = None

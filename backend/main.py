@@ -245,12 +245,15 @@ def create_app(service: Agent3Service | None = None, dataset_directory: Path | N
                     }
                 )
 
+        # Summaries carry no receipt, so read the owned cases in full.
+        owned_ids = {c.case_id for c in owned_cases}
         receipts = []
-        for case in owned_cases:
-            if getattr(case, "receipt", None) is not None:
+        for case in orchestrator.repository.list_full_cases(limit=200):
+            if case.case_id in owned_ids and case.receipt is not None:
                 receipts.append(
                     {
                         "receipt_id": case.receipt.receipt_id,
+                        "case_id": case.case_id,
                         "invoice_number": case.receipt.invoice_number,
                         "amount": str(case.receipt.amount) if case.receipt.amount else None,
                         "currency": case.receipt.currency,
@@ -421,8 +424,17 @@ def create_app(service: Agent3Service | None = None, dataset_directory: Path | N
         if case is None:
             raise HTTPException(status_code=404, detail="Case not found.")
         assert_owner(account, getattr(case, "owner_account_id", None))
+        from workflow.repository import summarise_for_human
+
+        why, problems, next_action = summarise_for_human(case)
         return WorkflowCaseView.model_validate(
-            {**case.model_dump(), "approval_policy": approval_policy(case, app.state.accounts)}
+            {
+                **case.model_dump(),
+                "approval_policy": approval_policy(case, app.state.accounts),
+                "why": why or None,
+                "problems": problems,
+                "next_action": next_action or None,
+            }
         )
 
     def _case_for_decision(case_id: str, http_request: Request):

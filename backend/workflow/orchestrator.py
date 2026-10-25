@@ -37,6 +37,7 @@ from .schemas import (
     PaymentAttempt,
     Intent,
     RoutingDecisionView,
+    TERMINAL_CASE_STATUSES,
     WorkflowCase,
     WorkflowType,
     utc_now,
@@ -136,6 +137,21 @@ def _blocking_reasons(analysis: AnalysisResult) -> list[str]:
     ]
     if blocking_fields:
         reasons.append("missing required fields: " + ", ".join(blocking_fields))
+    # An approval binds invoice, payee and amount, so a document that lacks any
+    # of them cannot become a payment, whatever its type. (Per-type required
+    # fields above only cover invoices; a report or letter could slip through.)
+    absent = [
+        label
+        for label, value in (
+            ("amount", analysis.financial_information.total_amount),
+            ("currency", analysis.currency or analysis.financial_information.currency),
+            ("payee", analysis.vendor.vendor_name),
+            ("invoice number", analysis.document_id),
+        )
+        if not value
+    ]
+    if absent and not blocking_fields:
+        reasons.append("nothing to pay: the document gives no " + ", ".join(absent))
     if validation.customer_verification == "mismatch":
         reasons.append("customer details contradict existing records")
     if analysis.contradictions:
@@ -149,6 +165,46 @@ def _blocking_reasons(analysis: AnalysisResult) -> list[str]:
     if failed_checks:
         reasons.append("failed checks: " + ", ".join(sorted(set(failed_checks))))
     return reasons
+
+
+def _appears_in(identifier: str, text: str | None) -> bool:
+    """True when ``identifier`` is written in ``text`` (case and spacing ignored)."""
+
+    if not text:
+        return False
+    squash = lambda value: "".join(value.split()).casefold()  # noqa: E731
+    return squash(identifier) in squash(text)
+
+
+def _message_gaps(analysis: AnalysisResult, intent: Intent) -> list[str]:
+    """What a text-only message is missing before it can be acted on."""
+
+    gaps: list[str] = []
+    if not analysis.document_id:
+        gaps.append("an invoice number")
+    # An upload of a clean invoice is read as "please pay this". A message is
+    # not an invoice, so it only becomes a payment when it actually asks for one.
+    asked_to_pay = analysis.detected_problem.primary_problem == PrimaryProblem.payment_request
+    if intent == Intent.new_payment_request and not asked_to_pay:
+        intent = Intent.unknown
+    if intent == Intent.unknown:
+        gaps.append(
+            "a clear description of the problem (for example: pay an invoice, a payment that failed, "
+            "or a payment you cannot see)"
+        )
+    if intent == Intent.new_payment_request:
+        # A payment approval binds invoice, payee and amount, so all must be stated.
+        if analysis.financial_information.total_amount is None:
+            gaps.append("the amount to pay")
+        if not (analysis.currency or analysis.financial_information.currency):
+            gaps.append("the currency")
+        if not analysis.vendor.vendor_name:
+            gaps.append("who the invoice is from (the vendor)")
+    return gaps
+
+
+def _join(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " or " + items[-1]
 
 
 class WorkflowOrchestrator:
@@ -196,8 +252,26 @@ class WorkflowOrchestrator:
     # ------------------------------------------------------------------
     # Case lifecycle
     # ------------------------------------------------------------------
-    def open_case(self, analysis: AnalysisResult, filename: str = "document.pdf") -> WorkflowCase:
-        """Create a case from Agent 3's analysis and route it immediately."""
+    def open_case(
+        self,
+        analysis: AnalysisResult,
+        filename: str = "document.pdf",
+        *,
+        channel: str = "upload",
+        source_text: str | None = None,
+    ) -> WorkflowCase:
+        """Create a case from Agent 3's analysis and route it immediately.
+
+        ``channel="message"`` marks a text-only customer message. Such a case
+        goes to human review when the text lacks what the request needs, and an
+        invoice number that does not appear in the text is discarded.
+        """
+
+        discarded_id = None
+        if channel == "message" and analysis.document_id and not _appears_in(analysis.document_id, source_text):
+            # Never act on an identifier the customer did not write.
+            discarded_id = analysis.document_id
+            analysis = analysis.model_copy(update={"document_id": None})
 
         # An invoice with payment history is never a brand-new request.
         prior_attempts = self.simulator.store.list_for_invoice(analysis.document_id)
@@ -207,6 +281,9 @@ class WorkflowOrchestrator:
             paid_already=paid_already,
             has_attempts=bool(prior_attempts),
         )
+        gaps = _message_gaps(analysis, intent) if channel == "message" else []
+        if gaps:
+            intent = Intent.unknown
         case = WorkflowCase(
             status=CaseStatus.received,
             intent=intent,
@@ -216,8 +293,19 @@ class WorkflowOrchestrator:
             amount=analysis.financial_information.total_amount,
             currency=analysis.currency or analysis.financial_information.currency,
             analysis=analysis.model_dump(mode="json"),
+            source_channel=channel if channel in {"upload", "message", "demo"} else None,
         )
         case.add_audit(AgentId.orchestrator, "case_opened", f"Case opened for {filename}.")
+        if discarded_id:
+            case.add_audit(
+                AgentId.orchestrator,
+                "identifier_discarded",
+                f"Agent 3 returned invoice number {discarded_id!r}, which does not appear in the "
+                "message, so it was discarded.",
+            )
+        if gaps:
+            case.pending_reason = "The message does not include " + _join(gaps) + "."
+            case.add_audit(AgentId.orchestrator, "message_incomplete", case.pending_reason)
         self._plan_runs(case)
         self.repository.save_case(case)
         return case
@@ -300,11 +388,13 @@ class WorkflowOrchestrator:
         # of this test - an unpaid invoice always has no verified payment, and
         # requiring one would make every new payment request impossible. The
         # human approval step is what covers the payment risk.
+        review_reason = case.pending_reason or "The problem could not be classified, or validation failed."
         if case.intent == Intent.new_payment_request:
             blocking_reasons = _blocking_reasons(analysis)
             if blocking_reasons:
                 case.intent = Intent.unknown
                 primary, supporting = AgentId.human_review, None
+                review_reason = "Agent 3 found unresolved issues: " + "; ".join(blocking_reasons) + "."
                 case.add_audit(
                     AgentId.orchestrator,
                     "routing_overridden",
@@ -344,7 +434,8 @@ class WorkflowOrchestrator:
             if primary == AgentId.human_approval:
                 order += [AgentId.human_approval, AgentId.agent_5]
             elif primary == AgentId.human_review:
-                order += [AgentId.human_review]
+                # Agent 5 still explains the outcome after a human-review route.
+                order += [AgentId.human_review, AgentId.agent_5]
             else:
                 order.append(primary)
                 if supporting:
@@ -367,9 +458,16 @@ class WorkflowOrchestrator:
         self.repository.save_case(case)
 
         if primary == AgentId.human_approval:
+            # Agent 1 reports BEFORE anyone is asked to approve, so the approver
+            # always decides with the duplicate and payment-history check in hand.
+            blocked = self._agent1_before_approval(case, analysis)
+            if blocked:
+                return self._block_before_approval(case, blocked)
+            if case.status == CaseStatus.awaiting_approval:
+                return case
             return self._await_approval(case)
         if primary == AgentId.human_review:
-            return self._human_review(case, "The problem could not be classified, or validation failed.")
+            return self._human_review(case, review_reason)
         return self._dispatch(case, primary, analysis)
 
     def _routing_reason(self, case: WorkflowCase, analysis: AnalysisResult) -> str:
@@ -502,8 +600,9 @@ class WorkflowOrchestrator:
         # Agent 5 is the FINAL agent on every path. A specialist never closes a
         # case on its own: Agent 5 issues the customer response and decides the
         # terminal status. This branch runs for Path B (customer problems),
-        # because Path A returns earlier through execute_payment.
-        if report.agent != AgentId.agent_5 and report.agent != AgentId.agent_4:
+        # because Path A returns earlier through execute_payment. Path A's own
+        # Agent 4 runs never come through here; they call the specialist directly.
+        if report.agent != AgentId.agent_5:
             return self._finish_path_b(case)
 
         if report.resolved and not report.requires_human:
@@ -569,6 +668,7 @@ class WorkflowOrchestrator:
         case.status = CaseStatus.requires_review
         case.requires_human = True
         case.outcome = reason
+        case.pending_reason = case.pending_reason or reason
         run = case.run_for(AgentId.human_review)
         if run:
             run.status = AgentRunStatus.requires_human
@@ -576,7 +676,133 @@ class WorkflowOrchestrator:
             run.started_at = run.started_at or utc_now()
         case.add_audit(AgentId.orchestrator, "human_review_required", reason, CaseStatus.requires_review.value)
         self.repository.save_case(case)
-        return case
+        # The case stays with a person, but Agent 5 still tells the customer
+        # what happened and what they can do.
+        return self._finish_with_agent5(
+            case,
+            lambda run: self.execution.explain_review(case, reason),
+            stage="explanation",
+            forced_status=CaseStatus.requires_review,
+            review_summary=reason,
+        )
+
+    # ------------------------------------------------------------------
+    # Agent 1 before approval
+    # ------------------------------------------------------------------
+    def _agent1_before_approval(self, case: WorkflowCase, analysis: AnalysisResult) -> str | None:
+        """Run Agent 1 on a new-payment case before it can await approval.
+
+        Returns the reason the payment is blocked, or None when the approver may
+        decide. Agent 1 is called directly rather than through ``run_agent`` so
+        no Path B handoff or Agent 5 explanation runs mid-way through Path A.
+        """
+
+        run = case.run_for(AgentId.agent_1)
+        if run is None:
+            run = AgentRun(
+                agent=AgentId.agent_1,
+                agent_name=AGENT_LABELS[AgentId.agent_1],
+                order=len(case.agent_runs),
+            )
+            case.agent_runs.append(run)
+        case.status = CaseStatus.investigating
+        run.status = AgentRunStatus.running
+        run.started_at = utc_now()
+        case.add_audit(
+            AgentId.orchestrator,
+            "handoff",
+            "Agent 1 is checking existing invoices and payment history before the case can be approved.",
+        )
+        case.add_audit(AgentId.agent_1, "agent_started", f"{AGENT_LABELS[AgentId.agent_1]} started.")
+
+        report = self.duplicates.investigate(case, analysis)
+        case.reports.append(report)
+        run.summary = report.summary
+        run.completed_at = utc_now()
+        case.add_audit(AgentId.agent_1, "agent_completed", report.summary)
+
+        reason = self._agent1_payment_block(case, report)
+        if reason:
+            run.status = AgentRunStatus.blocked
+            self.repository.save_case(case)
+            return reason
+
+        run.status = AgentRunStatus.completed
+        if report.requires_human and not report.resolved:
+            # No comparable history is not evidence of a duplicate.
+            run.summary = f"{report.summary} Nothing found blocks this payment; the approver decides."
+        investigation = report.data.get("investigation") or {}
+        if investigation.get("previous_payment_status") == "UNPAID_ELIGIBLE_FOR_APPROVAL":
+            # A repeat upload of an unpaid invoice reuses the original obligation.
+            self._to_approval(case, report, investigation)
+        self.repository.save_case(case)
+        return None
+
+    def _agent1_payment_block(self, case: WorkflowCase, report: AgentReport) -> str | None:
+        """Why Agent 1's report forbids paying this invoice, if it does."""
+
+        investigation = report.data.get("investigation") or {}
+        verdict = investigation.get("status")
+        # The *payment* verdict decides, not the invoice verdict. A repeated
+        # invoice that has never been paid is still payable once; only money
+        # that actually moved (or is stuck) blocks a new instruction.
+        payment_state = investigation.get("previous_payment_status")
+        if investigation.get("blocks_payment") is True and (
+            verdict in {
+                "CONFIRMED_DUPLICATE_PAYMENT",
+                "SUSPECTED_DUPLICATE_PAYMENT",
+                "REQUIRES_BANK_VERIFICATION",
+            }
+            or payment_state in {"ALREADY_PAID", "DUPLICATE_PAYMENT_DETECTED", "PAYMENT_PENDING"}
+        ):
+            found = (payment_state or verdict or "a blocking finding").replace("_", " ").lower()
+            return (
+                f"Agent 1 found {found} for invoice {case.invoice_number or '(unknown)'}, so it cannot be "
+                f"approved for payment. {report.summary}"
+            )
+        return self._duplicate_block(case)
+
+    def _existing_payment_block(self, case: WorkflowCase) -> str | None:
+        """Read-only re-check at approval time: has money moved since Agent 1 ran?"""
+
+        if not case.invoice_number:
+            return None
+        live = [
+            attempt
+            for attempt in self.simulator.store.list_for_invoice(case.invoice_number)
+            if attempt.status in {"SUCCESS", "PENDING"}
+        ]
+        if not live:
+            return None
+        return (
+            f"Since Agent 1's check, a {live[-1].status.lower()} payment was recorded for invoice "
+            f"{case.invoice_number}, so it cannot be approved again."
+        )
+
+    def _block_before_approval(self, case: WorkflowCase, reason: str) -> WorkflowCase:
+        """Stop a payment case before approval and let Agent 5 explain why."""
+
+        case.status = CaseStatus.requires_review
+        case.requires_human = True
+        case.outcome = reason
+        case.pending_reason = reason
+        for agent in (AgentId.human_approval, AgentId.payment_simulator, AgentId.agent_2):
+            self._skip_planned(case, agent, "Not reached: the payment was blocked before approval.")
+        approval_run = case.run_for(AgentId.human_approval)
+        if approval_run is not None and approval_run.status == AgentRunStatus.requires_human:
+            approval_run.status = AgentRunStatus.skipped
+            approval_run.summary = "Not reached: the payment was blocked before approval."
+        case.add_audit(
+            AgentId.orchestrator, "blocked_before_approval", reason, CaseStatus.requires_review.value
+        )
+        self.repository.save_case(case)
+        return self._finish_with_agent5(
+            case,
+            lambda run: self.execution.explain_review(case, reason),
+            stage="explanation",
+            forced_status=CaseStatus.requires_review,
+            review_summary="A person must resolve Agent 1's finding before any payment.",
+        )
 
     def _await_approval(self, case: WorkflowCase) -> WorkflowCase:
         case.status = CaseStatus.awaiting_approval
@@ -604,6 +830,7 @@ class WorkflowOrchestrator:
         simulate: str | None = None,
         failure_reason: str | None = None,
         failure_code: str | None = None,
+        approver_account_id: str | None = None,
     ) -> WorkflowCase:
         """Record a human approval bound to the case's exact payment terms."""
 
@@ -620,15 +847,23 @@ class WorkflowOrchestrator:
                 f"Case is {case.status.value}; only a case awaiting approval can be approved."
             )
 
-        # Path A requires Agent 1's duplicate/payment-history check before any
-        # money moves. It runs here, immediately before the human decision, and
-        # only blocks when it actually finds a duplicate or an existing payment.
-        if self._run_agent1_precheck(case):
-            self.repository.save_case(case)
-            return case
+        # Agent 1 already reported during routing. Re-check here as defence in
+        # depth: a case that predates that change still gets the full check, and
+        # every case gets a read-only look for money that moved since.
+        if not any(report.agent == AgentId.agent_1 for report in case.reports):
+            if self._run_agent1_precheck(case):
+                if case.status in TERMINAL_CASE_STATUSES and case.customer_response is None:
+                    case.customer_response = self.execution.customer_answer(case)
+                self.repository.save_case(case)
+                return case
+        else:
+            moved = self._existing_payment_block(case)
+            if moved:
+                return self._block_before_approval(case, moved)
 
         approval = ApprovalRecord(
             approved_by=approved_by,
+            approved_by_account_id=approver_account_id,
             invoice_number=case.invoice_number,
             payee=case.vendor_name,
             amount=case.amount,
@@ -649,6 +884,7 @@ class WorkflowOrchestrator:
             "approved",
             f"{approved_by} approved {case.amount} {case.currency} to {case.vendor_name}.",
             CaseStatus.approved.value,
+            actor_account_id=approver_account_id,
         )
         self.repository.save_approval(case.case_id, approval)
         self.repository.save_case(case)
@@ -733,7 +969,13 @@ class WorkflowOrchestrator:
             run.summary = "No comparable history; nothing blocks this payment."
         return False
 
-    def reject(self, case_id: str, rejected_by: str, reason: str | None = None) -> WorkflowCase:
+    def reject(
+        self,
+        case_id: str,
+        rejected_by: str,
+        reason: str | None = None,
+        rejector_account_id: str | None = None,
+    ) -> WorkflowCase:
         case = self.repository.get_case(case_id)
         if case is None:
             raise WorkflowError("Case not found.")
@@ -747,9 +989,22 @@ class WorkflowOrchestrator:
             run.status = AgentRunStatus.blocked
             run.summary = case.outcome
             run.completed_at = utc_now()
-        case.add_audit(AgentId.human_approval, "rejected", case.outcome, CaseStatus.failed.value)
+        case.add_audit(
+            AgentId.human_approval,
+            "rejected",
+            case.outcome,
+            CaseStatus.failed.value,
+            actor_account_id=rejector_account_id,
+        )
+        for agent in (AgentId.payment_simulator, AgentId.agent_2, AgentId.agent_4):
+            self._skip_planned(case, agent, "Not reached: the payment was rejected.")
         self.repository.save_case(case)
-        return case
+        return self._finish_with_agent5(
+            case,
+            lambda run: self.execution.report_rejection(case, reason),
+            stage="rejection",
+            forced_status=CaseStatus.failed,
+        )
 
     # ------------------------------------------------------------------
     # Payment execution
@@ -824,6 +1079,8 @@ class WorkflowOrchestrator:
             case.status = CaseStatus.pending if not initiation.blocking else CaseStatus.requires_review
             case.requires_human = bool(initiation.requires_human)
             case.outcome = initiation.summary
+            if case.customer_response is None and case.status in TERMINAL_CASE_STATUSES:
+                case.customer_response = self.execution.customer_answer(case)
             self.repository.save_case(case)
             return case
 
@@ -996,6 +1253,7 @@ class WorkflowOrchestrator:
         *,
         stage: str,
         forced_status: CaseStatus | None = None,
+        review_summary: str | None = None,
     ) -> WorkflowCase:
         """Run Agent 5's final step and settle the case's terminal status."""
 
@@ -1059,9 +1317,15 @@ class WorkflowOrchestrator:
         elif forced_status is not None:
             run.status = AgentRunStatus.completed
             case.status = forced_status
-            case.requires_human = True
             case.outcome = report.summary
-            self._ensure_human_review(case, "Human must act on the final failure report.")
+            if forced_status == CaseStatus.failed:
+                # A rejected request is finished; nobody else has to act on it.
+                case.requires_human = False
+            else:
+                case.requires_human = True
+                self._ensure_human_review(
+                    case, review_summary or "Human must act on the final failure report."
+                )
         else:
             run.status = AgentRunStatus.requires_human
             case.requires_human = True
@@ -1080,6 +1344,8 @@ class WorkflowOrchestrator:
                 case.status = CaseStatus.requires_review
                 self._ensure_human_review(case, "Human must resolve the reconciliation result.")
 
+        # Agent 5's plain-language answer, built from the facts above.
+        case.customer_response = self.execution.customer_answer(case)
         self.repository.save_case(case)
         return case
 

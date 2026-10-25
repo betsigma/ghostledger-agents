@@ -95,6 +95,10 @@ def create_app(service: Agent3Service | None = None, dataset_directory: Path | N
     accounts = install_auth(app, workflow_repository.path)
     ensure_bootstrap_admin(accounts, workflow_repository.path)
 
+    from workflow.admin_api import install_admin_routes
+
+    install_admin_routes(app)
+
     def catalog() -> dict[str, Any]:
         return load_synthetic_dataset(app.state.dataset_directory)
 

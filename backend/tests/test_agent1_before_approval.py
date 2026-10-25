@@ -182,3 +182,28 @@ def test_rejection_records_the_account_and_closes_with_agent5(workspace_tmp_path
     assert "Vendor bank details changed" in rejected.customer_response.answer
     assert "acct-9" not in rejected.customer_response.answer
     assert orchestrator.simulator.bank.count() == 0
+
+
+@pytest.mark.parametrize(
+    ("simulate", "code", "expected"),
+    [(None, None, CaseStatus.completed), ("FAILED", "BANK_TIMEOUT", CaseStatus.requires_review),
+     ("PENDING", None, CaseStatus.pending)],
+)
+def test_reexecuting_a_finished_case_keeps_its_outcome(workspace_tmp_path, simulate, code, expected):
+    """Regression: re-running execute on a COMPLETED case flipped it to PENDING."""
+
+    orchestrator, _ = build(workspace_tmp_path, f"reexec-{simulate}")
+    case = open_case(orchestrator, invoice=f"INV-PRE-RE-{simulate}")
+    done = orchestrator.approve(case.case_id, approved_by="admin", simulate=simulate, failure_code=code)
+    assert done.status == expected
+    outcome = done.customer_response.outcome if done.customer_response else None
+    rows = orchestrator.simulator.bank.count()
+
+    again = orchestrator.execute_payment(case.case_id)
+
+    assert again.last_payment_report.data.get("executed") is False
+    assert again.status == expected
+    assert (again.customer_response.outcome if again.customer_response else None) == outcome
+    assert (again.receipt is not None) == (done.receipt is not None)
+    assert orchestrator.simulator.bank.count() == rows
+    assert any(e.action == "execution_blocked" for e in again.audit)

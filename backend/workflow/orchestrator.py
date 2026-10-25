@@ -1054,6 +1054,10 @@ class WorkflowOrchestrator:
         if sim_run not in case.agent_runs:
             case.agent_runs.append(sim_run)
 
+        # A case that already ended keeps its outcome if this call moves no money.
+        finished_before = (case.status, sim_run.model_copy()) if (
+            case.status in TERMINAL_CASE_STATUSES or case.status == CaseStatus.pending
+        ) else None
         case.status = CaseStatus.executing
         sim_run.status = AgentRunStatus.running
         sim_run.started_at = utc_now()
@@ -1077,6 +1081,15 @@ class WorkflowOrchestrator:
         case.reports.append(initiation)
         if initiation.data.get("attempt"):
             case.payment = PaymentAttempt.model_validate(initiation.data["attempt"])
+
+        if initiation.data.get("executed") is False and finished_before is not None:
+            # A repeat request on a finished case: record it, change nothing else.
+            case.status, earlier_run = finished_before
+            case.agent_runs[case.agent_runs.index(sim_run)] = earlier_run
+            case.last_payment_report = initiation
+            case.add_audit(AgentId.payment_simulator, "execution_blocked", initiation.summary)
+            self.repository.save_case(case)
+            return case
 
         if initiation.data.get("executed") is False:
             # No money moved: blocked, or a repeated request.

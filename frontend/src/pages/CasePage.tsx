@@ -23,7 +23,7 @@ export function CaseView({ c, reload }: { c: WorkflowCase; reload: () => void })
 
   return (
     <article className="mx-auto max-w-[760px] space-y-4">
-      <Answer c={c} />
+      <Answer c={c} isCustomer={isCustomer} />
 
       <Card>
         <div className="flex flex-wrap items-center gap-2">
@@ -78,12 +78,15 @@ const Fact = ({ label, value }: { label: string; value: string }) => (
 );
 
 /** One answer, one next action. Agent 5's customer_response wins when present. */
-function Answer({ c }: { c: WorkflowCase }) {
+export function Answer({ c, isCustomer }: { c: WorkflowCase; isCustomer: boolean }) {
   const response = c.customer_response;
   const latest = [...c.reports].reverse().find((r) => r.summary);
   const title = response?.headline ?? statusLabel(c.status);
-  const sentence = response?.answer ?? c.pending_reason ?? latest?.summary ?? c.outcome ?? "GhostLedger is working on this case.";
-  const steps = response?.next_steps ?? [];
+  const sentence =
+    response?.answer ?? c.pending_reason ?? c.why ?? latest?.summary ?? c.outcome ?? "GhostLedger is working on this case.";
+  // next_action is written for the bank reviewer ("Approve … or reject it"), so
+  // only admins see it; a customer's next step comes from their own panel.
+  const steps = response?.next_steps ?? (!isCustomer && c.next_action ? [c.next_action] : []);
   return (
     <Card className={response?.payment_settled ? "ring-2 ring-green-500" : ""}>
       <h1 className="text-2xl">{title}</h1>
@@ -311,6 +314,12 @@ function Decision({ c }: { c: WorkflowCase }) {
       <p className="text-xs text-slate-500 dark:text-slate-400">
         Python checks (teal) are deterministic. Agent 3 source: {String(c.analysis?.analysis_source ?? "—")}.
       </p>
+      {c.problems && c.problems.length > 0 && (
+        <div>
+          <b>Problems found</b>
+          <ul className="mt-1 list-disc pl-5">{c.problems.map((p) => <li key={p}>{p}</li>)}</ul>
+        </div>
+      )}
       {checks.length > 0 && (
         <ul className="space-y-2">
           {checks.map((check, i) => (

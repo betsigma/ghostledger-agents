@@ -19,7 +19,7 @@ export default function MyPayments() {
       <ErrorText error={error} />
       {payments.length === 0 && <Empty>No payments yet.</Empty>}
       {payments.map((p) => {
-        const receipt = data?.receipts.find((r) => r.invoice_number === p.invoice_number && p.verified);
+        const receipt = data?.receipts.find((r) => r.case_id === p.case_id);
         return (
           <a key={p.attempt_id} href={`#/cases/${p.case_id}`} className="block">
             <Card className="hover:ring-ocean">

@@ -2,7 +2,7 @@ import { act, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, describe, expect, it } from "vitest";
 import { navFor, Page, SessionContext, type Me } from "./App";
-import { CaseView } from "./pages/CasePage";
+import { Answer, CaseView } from "./pages/CasePage";
 import { ApprovalsList } from "./pages/Approvals";
 import type { Role, WorkflowCase } from "./types";
 
@@ -87,5 +87,34 @@ describe("navigation by role", () => {
     for (const text of ["INV-7781", "Demo Customer A", "1,280.00 USD", "INSUFFICIENT_INFORMATION", "Needs human judgement"]) {
       expect(view.text()).toContain(text);
     }
+  });
+});
+
+describe("answer before Agent 5 replies", () => {
+  const triaged: WorkflowCase = {
+    ...awaiting,
+    why: "No comparison records are available.",
+    next_action: "Approve 1280.00 USD to Northstar Office Supplies LLC, or reject it.",
+  };
+
+  it("a customer sees why, but not the reviewer's approve step", () => {
+    const view = render(<Answer c={triaged} isCustomer />, "CUSTOMER");
+    expect(view.text()).toContain("No comparison records are available.");
+    expect(view.text()).not.toContain("Approve 1280.00 USD");
+  });
+
+  it("an admin also gets next_action as the one next step", () => {
+    const view = render(<Answer c={triaged} isCustomer={false} />, "BANK_ADMIN");
+    expect(view.text()).toContain("Approve 1280.00 USD to Northstar Office Supplies LLC, or reject it.");
+  });
+
+  it("Agent 5's answer wins once it exists", () => {
+    const answered: WorkflowCase = { ...triaged, customer_response: {
+      case_status: "COMPLETED", outcome: "PAID", headline: "Payment confirmed", answer: "Your payment is confirmed.",
+      next_steps: ["No action is needed."], payment_settled: true, missing_information: [], generated_by: "deterministic",
+    } };
+    const view = render(<Answer c={answered} isCustomer />, "CUSTOMER");
+    expect(view.text()).toContain("Payment confirmed");
+    expect(view.text()).not.toContain("No comparison records");
   });
 });

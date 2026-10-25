@@ -131,6 +131,10 @@ export interface WorkflowCase {
   customer_response: CustomerResponse | null;
   source_channel: "upload" | "message" | "demo" | null;
   approval_policy?: ApprovalPolicy | null;
+  // Triage fields, written for the bank reviewer (backend summarise_for_human).
+  why?: string | null;
+  problems?: string[];
+  next_action?: string | null;
 }
 
 export interface CaseSummary {

@@ -139,6 +139,8 @@ def create_app(service: Agent3Service | None = None, dataset_directory: Path | N
 
         body = payload or {}
         try:
+            # Public signup always creates a CUSTOMER. Any "role" in the body is
+            # ignored on purpose; admin accounts come from the seed tool.
             account = app.state.accounts.sign_up(
                 email=body.get("email"),
                 password=body.get("password"),

@@ -104,3 +104,16 @@ def test_signup_ignores_a_requested_role(workspace_tmp_path):
         assert response.json()["account"]["role"] == ROLE_CUSTOMER
         token = response.json()["token"]
         assert client.get("/bank/ledger", headers=auth(token)).status_code == 403
+
+
+def test_backend_front_page_sends_people_to_the_new_frontend(workspace_tmp_path, monkeypatch):
+    app, client = make_app(workspace_tmp_path, "front-page")
+
+    response = client.get("/", follow_redirects=False)
+    assert response.status_code == 307
+    assert response.headers["location"] == "http://127.0.0.1:5173"
+    # The old dashboard file is still reachable for reference.
+    assert client.get("/static/index.html").status_code == 200
+
+    monkeypatch.setenv("FRONTEND_URL", "http://localhost:3000")
+    assert client.get("/", follow_redirects=False).headers["location"] == "http://localhost:3000"

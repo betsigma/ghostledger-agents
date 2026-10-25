@@ -9,7 +9,7 @@ from typing import Annotated, Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from agent3.database import DocumentRepository
@@ -113,8 +113,10 @@ def create_app(service: Agent3Service | None = None, dataset_directory: Path | N
         return load_synthetic_dataset(app.state.dataset_directory)
 
     @app.get("/", include_in_schema=False)
-    def dashboard() -> FileResponse:
-        return FileResponse(BASE_DIR / "static" / "index.html")
+    def dashboard() -> RedirectResponse:
+        # The app is the frontend in /frontend. The old one-page dashboard is
+        # still served at /static/index.html, but it predates bank-side approval.
+        return RedirectResponse(os.getenv("FRONTEND_URL", "http://127.0.0.1:5173"))
 
     @app.get("/health")
     def health() -> dict[str, Any]:

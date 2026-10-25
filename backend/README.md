@@ -362,10 +362,12 @@ something outside this component confirms it.
 PDF upload → PyMuPDF text extraction → LLM analysis → Python validation → structured JSON
 ```
 
-Open `http://127.0.0.1:8000` to use the dashboard: upload a PDF, press **Analyze
-with AI**, then inspect the extracted customer information, the financial
-problem the model detected, the validation findings, the supporting excerpts
-with page numbers, and the full JSON.
+The web app lives in `../frontend` (see the top-level README); opening
+`http://127.0.0.1:8000` redirects there. The original one-page Agent 3
+dashboard is still at `http://127.0.0.1:8000/static/index.html`: upload a PDF,
+press **Analyze with AI**, then inspect the extracted customer information, the
+financial problem the model detected, the validation findings, the supporting
+excerpts with page numbers, and the full JSON.
 
 ## Setup
 

@@ -99,7 +99,9 @@ def activity(app, limit: int) -> dict[str, Any]:
     limit = max(1, min(int(limit), MAX_ACTIVITY))
     owners = _owner_names(app)
     entries: list[dict[str, Any]] = []
-    for case in app.state.workflow_repository.list_full_cases():
+    # A case's updated_at is stamped by its newest audit entry, so the newest
+    # ``limit`` entries all come from the ``limit`` most recently updated cases.
+    for case in app.state.workflow_repository.list_full_cases(limit):
         customer = _customer(case, owners)
         for entry in case.audit:
             entries.append(

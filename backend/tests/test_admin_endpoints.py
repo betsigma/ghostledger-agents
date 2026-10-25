@@ -108,3 +108,19 @@ def test_overview_counts(world):
 def test_bank_admin_role_constant_is_used(world):
     account = world["app"].state.accounts.get(world["admin_id"])
     assert account.role == ROLE_BANK_ADMIN
+
+
+def test_activity_limit_reads_newest_entries_without_loading_everything(world):
+    """Only `limit` cases are loaded, yet the result equals the full ordering."""
+
+    client, admin = world["client"], auth(world["admin"])
+    everything = client.get("/admin/activity?limit=500", headers=admin).json()["activity"]
+    for limit in (1, 3, 7):
+        top = client.get(f"/admin/activity?limit={limit}", headers=admin).json()["activity"]
+        assert [e["at"] for e in top] == [e["at"] for e in everything[:limit]]
+
+
+def test_full_case_listing_is_not_capped(world):
+    repository = world["app"].state.workflow_repository
+    assert len(repository.list_full_cases()) == 3
+    assert len(repository.list_full_cases(1)) == 1

@@ -322,13 +322,15 @@ class WorkflowRepository:
             conn.close()
         return WorkflowCase.model_validate_json(row["case_json"]) if row else None
 
-    def list_full_cases(self, limit: int = 1000) -> list[WorkflowCase]:
-        """Most recently updated cases in full, for the admin views."""
+    def list_full_cases(self, limit: int | None = None) -> list[WorkflowCase]:
+        """Most recently updated cases in full, for the admin views (all by default)."""
 
+        # shortcut: loads full case JSON per request; add aggregate queries if case counts grow large.
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT case_json FROM workflow_cases ORDER BY updated_at DESC LIMIT ?", (limit,)
+                "SELECT case_json FROM workflow_cases ORDER BY updated_at DESC LIMIT ?",
+                (-1 if limit is None else limit,),
             ).fetchall()
         finally:
             conn.close()

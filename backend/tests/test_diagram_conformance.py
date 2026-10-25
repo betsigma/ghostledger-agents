@@ -257,3 +257,23 @@ def test_customer_a_cannot_read_customer_b_case(workspace_tmp_path):
     assert client.get(f"/workflow/cases/{case['case_id']}", headers=auth(customer_b)).status_code == 200
     listing = client.get("/workflow/cases", headers=auth(customer_a)).json()
     assert all(item["case_id"] != case["case_id"] for item in listing)
+
+
+def test_model_reply_payment_status_dispute_routes_to_agent2(workspace_tmp_path):
+    """Regression: the enum allows this value although the prompt never asks for
+    it; Agent 3 used to crash with KeyError (HTTP 500) when a model sent it."""
+
+    app, client, customer, _admin, _ = setup(workspace_tmp_path, "psd")
+    note = "I already paid this invoice. Amount paid: 520.00"
+
+    response = upload(
+        app, client, customer, invoice_text("INV-DC-12", "520.00", note),
+        reply("INV-DC-12", "520.00", primary="payment_status_dispute",
+              problem="payment_status_discrepancy", paid="520.00", evidence="I already paid this invoice."),
+    )
+
+    assert response.status_code == 201, response.text
+    case = response.json()
+    assert case["analysis"]["routing"]["recommended_agent"] == "agent_2"
+    assert case["intent"] == "payment_status_dispute"
+    assert runs(case) == [("agent_3", C), ("agent_2", RH), ("agent_5", RH), ("human_review", RH)]

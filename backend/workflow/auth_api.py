@@ -93,6 +93,57 @@ def require_admin(request) -> Account:
     return account
 
 
+def require_role(request, roles: set[str], message: str) -> Account:
+    """The caller must be signed in with one of ``roles``; 403 with ``message`` otherwise."""
+
+    account = current_account(request)
+    if account is None:
+        raise HTTPException(status_code=401, detail="Sign in to continue.")
+    if account.role not in roles:
+        raise HTTPException(status_code=403, detail=message)
+    return account
+
+
+def require_signed_in_customer(request) -> Account:
+    """Only a CUSTOMER account: customers send messages, the bank side does not."""
+
+    return require_role(
+        request,
+        {ROLE_CUSTOMER},
+        "Only customer accounts can send a message. Bank and demo administrators review cases instead.",
+    )
+
+
+def require_demo_admin(request) -> Account:
+    from .accounts import ROLE_DEMO_ADMIN
+
+    return require_role(
+        request, {ROLE_DEMO_ADMIN}, "Test scenarios can only be run by a demo administrator."
+    )
+
+
+def assert_can_approve(account: Account, owner_account_id: str | None) -> None:
+    """Approval belongs to the bank side, and never to the person who asked.
+
+    Call after ``assert_owner``, so a customer probing someone else's case still
+    gets a plain 404 and learns nothing about it.
+    """
+
+    if account.role not in ADMIN_ROLES:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Customers can request payments but cannot approve them. "
+                "A bank administrator must approve or reject this payment."
+            ),
+        )
+    if owner_account_id and owner_account_id == account.account_id:
+        raise HTTPException(
+            status_code=403,
+            detail="You requested this payment, so you cannot approve or reject it yourself.",
+        )
+
+
 def assert_owner(account: Account, owner_account_id: str | None) -> None:
     """Raise unless the account owns the record.
 

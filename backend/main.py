@@ -25,13 +25,14 @@ from agent3.synthetic_data import create_synthetic_dataset, load_synthetic_datas
 from workflow.agent1_history import InvoiceHistoryRepository
 from workflow.orchestrator import WorkflowError, WorkflowOrchestrator
 from workflow.repository import WorkflowRepository
-from workflow.schemas import CaseSummary, WorkflowCase
+from workflow.schemas import CaseSummary, WorkflowCase, WorkflowCaseView
 from workflow.seed import synthetic_bank_seed
 
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
+MAX_MESSAGE_CHARS = int(os.getenv("MAX_MESSAGE_CHARS", "20000"))
 
 
 def _dataset_directory() -> Path:
@@ -327,12 +328,9 @@ def create_app(service: Agent3Service | None = None, dataset_directory: Path | N
         account = require_customer(http_request)
         document = await _read_upload(file)
         analysis = app.state.service.analyze(document)
-        orchestrator: WorkflowOrchestrator = app.state.orchestrator
-        case = orchestrator.open_case(analysis, filename=document.filename or "document.pdf")
-        # Stamp ownership before routing, so every later write inherits it.
-        case.owner_account_id = account.account_id
-        orchestrator.repository.save_case(case)
-        return orchestrator.route(case)
+        return _open_and_route(
+            analysis, account, filename=document.filename or "document.pdf", channel="upload"
+        )
 
     @app.get("/workflow/cases", response_model=list[CaseSummary])
     def list_cases(request: Request, limit: int = 50) -> list[CaseSummary]:
@@ -351,8 +349,59 @@ def create_app(service: Agent3Service | None = None, dataset_directory: Path | N
             if getattr(c, "owner_account_id", None) == account.account_id
         ]
 
-    @app.get("/workflow/cases/{case_id}", response_model=WorkflowCase)
-    def get_case(case_id: str, request: Request) -> WorkflowCase:
+    @app.post("/workflow/cases/message", response_model=WorkflowCase, status_code=201)
+    def open_message_case(http_request: Request, payload: dict[str, Any] | None = None) -> WorkflowCase:
+        """A customer describes a problem in words instead of uploading a PDF.
+
+        The text runs through the same Agent 3 analysis, case opening, ownership
+        stamping and routing as an upload. A message without enough to act on
+        goes to human review saying what is missing.
+        """
+
+        from agent3.document_reader import read_plain_text
+        from workflow.auth_api import require_signed_in_customer
+
+        account = require_signed_in_customer(http_request)
+        message = (payload or {}).get("message")
+        if not isinstance(message, str) or not message.strip():
+            raise HTTPException(status_code=400, detail="Write a message describing what you need.")
+        if len(message) > MAX_MESSAGE_CHARS:
+            raise HTTPException(
+                status_code=413, detail=f"Messages are limited to {MAX_MESSAGE_CHARS:,} characters."
+            )
+        try:
+            document = read_plain_text(message)
+        except DocumentReadError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _open_and_route(
+            app.state.service.analyze(document), account,
+            filename="customer message", channel="message", source_text=document.text,
+        )
+
+    def _open_and_route(analysis, account, *, filename: str, channel: str, source_text=None) -> WorkflowCase:
+        """Open a case from Agent 3's analysis, stamp the owner, then route it."""
+
+        orchestrator: WorkflowOrchestrator = app.state.orchestrator
+        case = orchestrator.open_case(analysis, filename=filename, channel=channel, source_text=source_text)
+        # Stamp ownership before routing, so every later write inherits it.
+        case.owner_account_id = account.account_id
+        orchestrator.repository.save_case(case)
+        return orchestrator.route(case)
+
+    @app.get("/workflow/approvals")
+    def approvals_queue(request: Request) -> dict[str, Any]:
+        """Cases awaiting a bank-side decision, each with Agent 1's result. Admins only."""
+
+        from workflow.approvals import approval_queue
+        from workflow.auth_api import require_admin
+
+        require_admin(request)
+        items = approval_queue(app.state.workflow_repository, app.state.accounts)
+        return {"count": len(items), "approvals": items}
+
+    @app.get("/workflow/cases/{case_id}", response_model=WorkflowCaseView)
+    def get_case(case_id: str, request: Request) -> WorkflowCaseView:
+        from workflow.approvals import approval_policy
         from workflow.auth_api import assert_owner, require_customer
 
         account = require_customer(request)
@@ -360,49 +409,59 @@ def create_app(service: Agent3Service | None = None, dataset_directory: Path | N
         if case is None:
             raise HTTPException(status_code=404, detail="Case not found.")
         assert_owner(account, getattr(case, "owner_account_id", None))
-        return case
+        return WorkflowCaseView.model_validate(
+            {**case.model_dump(), "approval_policy": approval_policy(case, app.state.accounts)}
+        )
 
-    @app.post("/workflow/cases/{case_id}/approve", response_model=WorkflowCase)
-    def approve_case(case_id: str, request: dict[str, Any], http_request: Request) -> WorkflowCase:
-        """Record human approval and let Agent 5 execute the synthetic payment."""
+    def _case_for_decision(case_id: str, http_request: Request):
+        """The case and the bank-side account allowed to decide on it."""
 
-        from workflow.auth_api import assert_owner, require_customer
+        from workflow.auth_api import assert_can_approve, assert_owner, require_customer
 
         account = require_customer(http_request)
         existing = app.state.orchestrator.get(case_id)
         if existing is None:
             raise HTTPException(status_code=404, detail="Case not found.")
+        # Ownership first: a customer probing another account's case gets 404.
         assert_owner(account, getattr(existing, "owner_account_id", None))
+        assert_can_approve(account, getattr(existing, "owner_account_id", None))
+        return existing, account
 
-        approved_by = str(request.get("approved_by") or "").strip()
-        if not approved_by:
-            raise HTTPException(status_code=400, detail="approved_by is required.")
+    @app.post("/workflow/cases/{case_id}/approve", response_model=WorkflowCase)
+    def approve_case(case_id: str, http_request: Request, request: dict[str, Any] | None = None) -> WorkflowCase:
+        """Record a bank-side approval and run the synthetic payment.
+
+        The approver is the signed-in account; any ``approved_by`` in the body
+        is ignored.
+        """
+
+        _existing, account = _case_for_decision(case_id, http_request)
+        body = request or {}
         try:
             return app.state.orchestrator.approve(
                 case_id,
-                approved_by=approved_by,
-                note=request.get("note"),
-                simulate=str(request.get("simulate") or "SUCCESS"),
-                failure_reason=request.get("failure_reason"),
+                approved_by=f"{account.display_name} ({account.account_id})",
+                approver_account_id=account.account_id,
+                note=body.get("note"),
+                simulate=str(body.get("simulate") or "SUCCESS"),
+                failure_reason=body.get("failure_reason"),
             )
         except WorkflowError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/workflow/cases/{case_id}/reject", response_model=WorkflowCase)
-    def reject_case(case_id: str, request: dict[str, Any], http_request: Request) -> WorkflowCase:
-        from workflow.auth_api import assert_owner, require_customer
+    def reject_case(case_id: str, http_request: Request, request: dict[str, Any] | None = None) -> WorkflowCase:
+        """Record a bank-side rejection. The rejector is the signed-in account."""
 
-        account = require_customer(http_request)
-        existing = app.state.orchestrator.get(case_id)
-        if existing is None:
-            raise HTTPException(status_code=404, detail="Case not found.")
-        assert_owner(account, getattr(existing, "owner_account_id", None))
-
-        rejected_by = str(request.get("rejected_by") or "").strip()
-        if not rejected_by:
-            raise HTTPException(status_code=400, detail="rejected_by is required.")
+        _existing, account = _case_for_decision(case_id, http_request)
+        body = request or {}
         try:
-            return app.state.orchestrator.reject(case_id, rejected_by, request.get("reason"))
+            return app.state.orchestrator.reject(
+                case_id,
+                f"{account.display_name} ({account.account_id})",
+                body.get("reason"),
+                rejector_account_id=account.account_id,
+            )
         except WorkflowError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
